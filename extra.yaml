@@ -1,0 +1,77 @@
+active_set: minimal-mlp
+sets:
+  - set_id: minimal-mlp
+    description: Minimal MLP system
+    data_processing_chain:
+      method: mean_aggregation_chain
+    data_processing_chain_method_parameters:
+      mean_aggregation_chain:
+        chain:
+          - processor_name: dcase_util.processors.FeatureReadingProcessor
+          - processor_name: dcase_util.processors.NormalizationProcessor
+            init_parameters:
+              enable: true
+          - processor_name: dcase_util.processors.AggregationProcessor
+            init_parameters:
+              aggregation_recipe:
+                - mean
+              win_length_frames: 500
+              hop_length_frames: 500
+          - processor_name: dcase_util.processors.DataShapingProcessor
+            init_parameters:
+              axis_list:
+                - time_axis
+                - data_axis
+    learner:
+      method: mlp_mini
+    learner_method_parameters:
+      mlp_mini:
+        random_seed: 0
+        keras_profile: deterministic
+        backend: tensorflow
+        validation_set:
+          validation_amount: 0.20
+          balancing_mode: identifier_two_level_hierarchy
+          seed: 0
+        data:
+          data_format: channels_last
+          target_format: same
+        model:
+          config:
+            - class_name: Dense
+              config:
+                units: 50
+                kernel_initializer: uniform
+                activation: relu
+                input_shape:
+                  - FEATURE_VECTOR_LENGTH
+            - class_name: Dropout
+              config:
+                rate: 0.2
+            - class_name: Dense
+              config:
+                units: 50
+                kernel_initializer: uniform
+                activation: relu
+            - class_name: Dropout
+              config:
+                rate: 0.2
+            - class_name: Dense
+              config:
+                units: CLASS_COUNT
+                kernel_initializer: uniform
+                activation: softmax
+        compile:
+          loss: categorical_crossentropy
+          metrics:
+            - categorical_accuracy
+        optimizer:
+          class_name: Adam
+        fit:
+          epochs: 50
+          batch_size: 64
+          shuffle: true
+        callbacks:
+          StasherCallback:
+            monitor: val_categorical_accuracy
+            initial_delay: 25
