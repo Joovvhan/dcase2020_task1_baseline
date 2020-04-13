@@ -1,5 +1,8 @@
 datasets/
 system/
+logs/
+
+nohup.out
 
 # Created by .ignore support plugin (hsz.mobi)
 ### Python template

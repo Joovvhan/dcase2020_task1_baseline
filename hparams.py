@@ -16,8 +16,12 @@ hparams.update({
 })
 
 hparams.update({
-    'max_epoch': 2,
+    'max_epoch': 100,
     'batch_size': 16,
+})
+
+hparams.update({
+    'logging_steps': 50,
 })
 
 # 10 Acoustic Scenes

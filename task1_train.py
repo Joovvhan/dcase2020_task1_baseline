@@ -1,5 +1,6 @@
 import os
 import csv
+import datetime
 from collections import namedtuple, defaultdict
 import librosa
 from copy import deepcopy
@@ -9,11 +10,12 @@ from threading import Thread
 from tqdm import tqdm
 import numpy as np
 
-
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch
+
+from torch.utils.tensorboard import SummaryWriter
 
 from hparams import hparams, DEVICE_DICT, CITY_DICT, SCENE_DICT
 
@@ -161,7 +163,6 @@ class DatasetLoader:
             # print(' * End of queue reached')
             return None
         
-
     def generator(self):
         # print('[Inside Generator]')
         while any(map(Thread.is_alive, self.thread_list)):
@@ -178,11 +179,39 @@ class DatasetLoader:
             if len(batch_data_list) > 0:
                 yield data_list_to_batch(batch_data_list)
 
+class Averager:
+    
+    def __init__(self, value = 0, count = 0):
+        self.value = value
+        self.count = count
+        
+    def __iadd__(self, value):
+        self.value = (self.count * self.value + value) / (self.count + 1)
+        self.count += 1
+        
+        return self
+    
+    def __add__(self, value):
+        new_value = (self.count * self.value + value) / (self.count + 1)
+        new_count = self.count + 1
+        new_averager = Averager(new_value, new_count)
+        return new_averager
+    
+    def __repr__(self):
+        return 'Value: {} / Count: {}'.format(self.value, self.count)
+
+    def reset(self):
+        self.value = 0
+        self.count = 0
+
+
 def train(**argv):
     metadata_path = argv['metadata_path']
     print(argv)
 
+
 class CRNN_Net(nn.Module):
+    
     def __init__(self):
         super(CRNN_Net, self).__init__()
         self.conv = nn.Conv2d(1, 256, kernel_size=(80, 11), stride=5)
@@ -192,6 +221,8 @@ class CRNN_Net(nn.Module):
 #         self.rnn_4 = nn.RNN(64, 32)
         self.fc = nn.Linear(128 * 19, len(SCENE_DICT))
         # (B, M[80], H[1], T[101]) => (B, M[80], H[256], T[21])
+        self.fc_device = nn.Linear(128 * 19, len(DEVICE_DICT))
+        self.fc_city = nn.Linear(128 * 19, len(CITY_DICT))
         
     def forward(self, tensor):
         tensor = tensor.unsqueeze(1)
@@ -204,12 +235,16 @@ class CRNN_Net(nn.Module):
 #         tensor, _ = self.rnn_4(tensor)
         tensor = tensor.permute(1, 2, 0) # (T, B, H) => (B, H, T)
         tensor = tensor.reshape(tensor.shape[0], -1)
-        tensor = self.fc(tensor)
-        tensor = F.log_softmax(tensor, dim=-1)
+        tensor_scene = self.fc(tensor)
+        tensor_scene = F.log_softmax(tensor_scene, dim=-1)
 
-        return tensor
+        tensor_device = self.fc_device(tensor)
+        tensor_device = F.log_softmax(tensor_device, dim=-1)
 
-net = CRNN_Net()
+        tensor_city = self.fc_city(tensor)
+        tensor_city = F.log_softmax(tensor_city, dim=-1)
+
+        return tensor_scene, tensor_city, tensor_device
 
 if __name__ == '__main__':
 
@@ -219,6 +254,11 @@ if __name__ == '__main__':
     dataset_name = 'TAU-urban-acoustic-scenes-2020-mobile-development'
 
     dataset_base_path = os.path.join('datasets', dataset_name)
+
+    run_name = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    log_path = os.path.join('logs', run_name)
+    os.makedirs(log_path, exist_ok=True)
 
     metadata_train_path = dataset_base_path + '/' + 'evaluation_setup' + '/' + 'fold1_train.csv'
 
@@ -239,9 +279,20 @@ if __name__ == '__main__':
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+    tensor_writer = SummaryWriter(log_path)
+
     net = CRNN_Net().to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(net.parameters(), lr=0.001, momentum=0.9)
+
+    train_steps = 0
+    eval_steps = 0
+
+    loss_scene_train_avg = Averager()
+    acc_scene_train_avg = Averager()
+    loss_scene_eval_avg = Averager()
+    acc_scene_eval_avg = Averager()
+    
 
     for epoch in range(hparams['max_epoch']):
 
@@ -251,21 +302,57 @@ if __name__ == '__main__':
             
             mel_spectrogram_batch, file_path_list, city_label, device_label, scene_label = batch
             optimizer.zero_grad()
-            outputs = net(mel_spectrogram_batch.to(device))
-            loss = criterion(outputs, torch.tensor(scene_label, dtype=torch.int64).to(device))
+            outputs_scene, outputs_city, outputs_device = net(mel_spectrogram_batch.to(device))
+            loss_scene = criterion(outputs_scene, torch.tensor(scene_label, dtype=torch.int64).to(device))
+            loss = loss_scene # 
             loss.backward()
             optimizer.step()
 
-            print(loss.item())
+            pred_scene = torch.argmax(outputs_scene, 1)
+            acc_scene = torch.sum(pred_scene == torch.tensor(scene_label).to(device)).cpu().numpy() / len(scene_label)
+
+            loss_scene_train_avg += loss_scene.item()
+            acc_scene_train_avg += acc_scene
+
+            # print(loss.item())
+            if train_steps % hparams['logging_steps'] == 0:
+                tensor_writer.add_scalar('train/loss', loss_scene_train_avg.value, train_steps)
+                tensor_writer.add_scalar('train/acc_scene', acc_scene_train_avg.value, train_steps)
+
+                loss_scene_train_avg.reset()
+                acc_scene_train_avg.reset()
+
+            train_steps += 1
+
+            # break
 
             # print(batch[0].shape)
 
         print('[ Evaluation Epoch #{:03d} ]'.format(epoch))
         eval_dataset_loader.start_loading()
         for i, batch in tqdm(enumerate(eval_dataset_loader.generator()), total=eval_dataset_loader.max_batch_size):
-            pass
-            # print(i, batch)
-            # print(batch[0].shape)
+
+            mel_spectrogram_batch, file_path_list, city_label, device_label, scene_label = batch
+            outputs_scene, outputs_city, outputs_device = net(mel_spectrogram_batch.to(device))
+            loss_scene = criterion(outputs_scene, torch.tensor(scene_label, dtype=torch.int64).to(device))
+
+            pred_scene = torch.argmax(outputs_scene, 1)
+            acc_scene = torch.sum(pred_scene == torch.tensor(scene_label).to(device)).cpu().numpy() / len(scene_label)
+
+            loss_scene_eval_avg += loss_scene.item()
+            acc_scene_eval_avg += acc_scene
+
+            if eval_steps % hparams['logging_steps'] == 0:
+                tensor_writer.add_scalar('eval/loss', loss_scene_eval_avg.value, eval_steps)
+                tensor_writer.add_scalar('eval/acc_scene', acc_scene_eval_avg.value, eval_steps)
+                loss_scene_eval_avg.reset()
+                acc_scene_eval_avg.reset()
+
+            eval_steps += 1
+
+            # break
+        
+        # break
 
     # inspect_metadata(metadata_train)
 
