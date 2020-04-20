@@ -218,20 +218,31 @@ class CRNN_Net(nn.Module):
         # self.rnn_1 = nn.RNN(256, 256)
         # self.rnn_2 = nn.RNN(256, 128)
 
-        self.conv = nn.Conv2d(1, 128, kernel_size=(80, 11), stride=5)
-        self.rnn_1 = nn.RNN(128, 128)
-        self.rnn_2 = nn.RNN(128, 64)
+        self.conv = nn.Conv2d(1, 128, kernel_size=(80, 11), stride=1)
+        self.rnn_1 = nn.RNN(128, 64, bidirectional=True)
+        self.rnn_2 = nn.RNN(128, 64, bidirectional=True)
+        self.rnn_3 = nn.RNN(128, 32, bidirectional=True)
+        self.rnn_4 = nn.RNN(64, 32, bidirectional=True)
 
-#         self.rnn_3 = nn.RNN(128, 64)
-#         self.rnn_4 = nn.RNN(64, 32)
-        self.fc = nn.Linear(64 * 19, len(SCENE_DICT))
+        # output_T = 19
+        # output_T = 31
+        output_T = 91
+
+        self.dropout_p = 0.2
+
+        # m1: [256 x 1984], m2: [1216 x 10]
+        # m1: [256 x 5824], m2: [1984 x 992]
+
+        self.fc = nn.Linear(64 * output_T, 32 * output_T)
+        self.fc_2 = nn.Linear(32 * output_T, 16 * output_T)
+        self.fc_3 = nn.Linear(16 * output_T, len(SCENE_DICT))
         # self.fc = nn.Linear(128 * 19, len(SCENE_DICT))
         # (B, M[80], H[1], T[101]) => (B, M[80], H[256], T[21])
         # self.fc_device = nn.Linear(128 * 19, len(DEVICE_DICT))
         # self.fc_city = nn.Linear(128 * 19, len(CITY_DICT))
 
-        self.fc_device = nn.Linear(64 * 19, len(DEVICE_DICT))
-        self.fc_city = nn.Linear(64 * 19, len(CITY_DICT))
+        self.fc_device = nn.Linear(64 * output_T, len(DEVICE_DICT))
+        self.fc_city = nn.Linear(64 * output_T, len(CITY_DICT))
         
     def forward(self, tensor):
         tensor = tensor.unsqueeze(1)
@@ -239,12 +250,23 @@ class CRNN_Net(nn.Module):
         tensor = tensor.squeeze(2)
         tensor = tensor.permute(2, 0, 1) # (B, H, T) => (T, B, H)
         tensor, _ = self.rnn_1(tensor)
+        tensor = F.dropout(tensor, self.dropout_p)
+
         tensor, _ = self.rnn_2(tensor)
-#         tensor, _ = self.rnn_3(tensor)
-#         tensor, _ = self.rnn_4(tensor)
+        tensor = F.dropout(tensor, self.dropout_p)
+
+        tensor, _ = self.rnn_3(tensor)
+        tensor = F.dropout(tensor, self.dropout_p)
+
+        tensor, _ = self.rnn_4(tensor)
+        tensor = F.dropout(tensor, self.dropout_p)
         tensor = tensor.permute(1, 2, 0) # (T, B, H) => (B, H, T)
         tensor = tensor.reshape(tensor.shape[0], -1)
         tensor_scene = self.fc(tensor)
+        tensor_scene = F.dropout(tensor_scene, self.dropout_p)
+        tensor_scene = self.fc_2(tensor_scene)
+        tensor_scene = F.dropout(tensor_scene, self.dropout_p)
+        tensor_scene = self.fc_3(tensor_scene)
         tensor_scene = F.log_softmax(tensor_scene, dim=-1)
 
         tensor_device = self.fc_device(tensor)
@@ -264,7 +286,7 @@ if __name__ == '__main__':
 
     dataset_base_path = os.path.join('datasets', dataset_name)
 
-    run_name = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_name = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + '_all_good'
 
     log_path = os.path.join('logs', run_name)
     os.makedirs(log_path, exist_ok=True)
@@ -299,9 +321,17 @@ if __name__ == '__main__':
 
     loss_scene_train_avg = Averager()
     acc_scene_train_avg = Averager()
+    loss_device_train_avg = Averager()
+    acc_device_train_avg = Averager()
+    loss_city_train_avg = Averager()
+    acc_city_train_avg = Averager()
+
     loss_scene_eval_avg = Averager()
     acc_scene_eval_avg = Averager()
-    
+    loss_device_eval_avg = Averager()
+    acc_device_eval_avg = Averager()
+    loss_city_eval_avg = Averager()
+    acc_city_eval_avg = Averager()
 
     for epoch in range(hparams['max_epoch']):
 
@@ -312,27 +342,44 @@ if __name__ == '__main__':
             mel_spectrogram_batch, file_path_list, city_label, device_label, scene_label = batch
             optimizer.zero_grad()
             outputs_scene, outputs_city, outputs_device = net(mel_spectrogram_batch.to(device))
-
-            print(outputs_scene.shape)
-
             loss_scene = criterion(outputs_scene, torch.tensor(scene_label, dtype=torch.int64).to(device))
-            loss = loss_scene # 
+            loss_city = criterion(outputs_city, torch.tensor(city_label, dtype=torch.int64).to(device))
+            loss_device = criterion(outputs_device, torch.tensor(device_label, dtype=torch.int64).to(device))
+            loss = loss_scene + loss_city / 10 + loss_device / 10
             loss.backward()
             optimizer.step()
 
             pred_scene = torch.argmax(outputs_scene, 1)
             acc_scene = torch.sum(pred_scene == torch.tensor(scene_label).to(device)).cpu().numpy() / len(scene_label)
 
+            pred_city = torch.argmax(outputs_city, 1)
+            acc_city = torch.sum(pred_city == torch.tensor(city_label).to(device)).cpu().numpy() / len(city_label)
+
+            pred_device = torch.argmax(outputs_device, 1)
+            acc_device = torch.sum(pred_device == torch.tensor(device_label).to(device)).cpu().numpy() / len(device_label)
+
             loss_scene_train_avg += loss_scene.item()
             acc_scene_train_avg += acc_scene
+            loss_device_train_avg += loss_device.item()
+            acc_device_train_avg += acc_device
+            loss_city_train_avg += loss_city.item()
+            acc_city_train_avg += acc_city
 
             # print(loss.item())
             if train_steps % hparams['logging_steps'] == 0:
                 tensor_writer.add_scalar('train/loss_scene', loss_scene_train_avg.value, train_steps)
                 tensor_writer.add_scalar('train/acc_scene', acc_scene_train_avg.value, train_steps)
+                tensor_writer.add_scalar('train/loss_device', loss_device_train_avg.value, train_steps)
+                tensor_writer.add_scalar('train/acc_device', acc_device_train_avg.value, train_steps)
+                tensor_writer.add_scalar('train/loss_city', loss_city_train_avg.value, train_steps)
+                tensor_writer.add_scalar('train/acc_city', acc_city_train_avg.value, train_steps)
 
                 loss_scene_train_avg.reset()
                 acc_scene_train_avg.reset()
+                loss_device_train_avg.reset()
+                acc_device_train_avg.reset()
+                loss_city_train_avg.reset()
+                acc_city_train_avg.reset()
 
             train_steps += 1
 
@@ -347,39 +394,40 @@ if __name__ == '__main__':
             mel_spectrogram_batch, file_path_list, city_label, device_label, scene_label = batch
             outputs_scene, outputs_city, outputs_device = net(mel_spectrogram_batch.to(device))
             loss_scene = criterion(outputs_scene, torch.tensor(scene_label, dtype=torch.int64).to(device))
+            loss_city = criterion(outputs_city, torch.tensor(city_label, dtype=torch.int64).to(device))
+            loss_device = criterion(outputs_device, torch.tensor(device_label, dtype=torch.int64).to(device))
 
             pred_scene = torch.argmax(outputs_scene, 1)
             acc_scene = torch.sum(pred_scene == torch.tensor(scene_label).to(device)).cpu().numpy() / len(scene_label)
 
+            pred_city = torch.argmax(outputs_city, 1)
+            acc_city = torch.sum(pred_city == torch.tensor(city_label).to(device)).cpu().numpy() / len(city_label)
+
+            pred_device = torch.argmax(outputs_device, 1)
+            acc_device = torch.sum(pred_device == torch.tensor(device_label).to(device)).cpu().numpy() / len(device_label)
+
             loss_scene_eval_avg += loss_scene.item()
             acc_scene_eval_avg += acc_scene
+            loss_device_eval_avg += loss_device.item()
+            acc_device_eval_avg += acc_device
+            loss_city_eval_avg += loss_city.item()
+            acc_city_eval_avg += acc_city
 
             if eval_steps % hparams['logging_steps'] == 0:
                 tensor_writer.add_scalar('eval/loss_scene', loss_scene_eval_avg.value, eval_steps)
                 tensor_writer.add_scalar('eval/acc_scene', acc_scene_eval_avg.value, eval_steps)
+                tensor_writer.add_scalar('eval/loss_device', loss_device_eval_avg.value, eval_steps)
+                tensor_writer.add_scalar('eval/acc_device', acc_device_eval_avg.value, eval_steps)
+                tensor_writer.add_scalar('eval/loss_city', loss_city_eval_avg.value, eval_steps)
+                tensor_writer.add_scalar('eval/acc_city', acc_city_eval_avg.value, eval_steps)
+
                 loss_scene_eval_avg.reset()
                 acc_scene_eval_avg.reset()
+                loss_device_eval_avg.reset()
+                acc_device_eval_avg.reset()
+                loss_city_eval_avg.reset()
+                acc_city_eval_avg.reset()
 
             eval_steps += 1
 
             # break
-        
-        # break
-
-    # inspect_metadata(metadata_train)
-
-    # inspect_metadata_audio_file(metadata_eval)
-
-    # inspect_metadata_audio_file(dataset_base_path, metadata_train)
-
-    '''
-        
-        optimizer.zero_grad()
-
-        outputs = net(inputs)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-
-        running_loss += loss.item()
-    '''
